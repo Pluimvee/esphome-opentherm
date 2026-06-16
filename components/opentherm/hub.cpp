@@ -318,11 +318,11 @@ void OpenthermHub::check_timings_(uint32_t cur_time) {
 }
 
 bool OpenthermHub::should_skip_loop_(uint32_t cur_time) const {
-  if (this->last_conversation_end_ > 0 && (cur_time - this->last_conversation_end_) < 100) {
-    ESP_LOGV(TAG, "Less than 100 ms elapsed since last convo, skipping this iteration");
+  // Wait until 500ms have elapsed since conversation START.
+  // If the conversation itself took longer (e.g. timeout ~1000ms), skip immediately.
+  if (this->last_conversation_start_ > 0 && (cur_time - this->last_conversation_start_) < 500) {
     return true;
   }
-
   return false;
 }
 
@@ -345,6 +345,11 @@ void OpenthermHub::start_conversation_() {
   // Send the request
   this->last_conversation_start_ = millis();
   this->opentherm_->send(request);
+  // Enable interrupt immediately so we don't miss the boiler's response
+  // during other components' loop() (e.g. display update).
+  if (!this->sync_mode_) {
+    this->opentherm_->listen();
+  }
 }
 
 void OpenthermHub::read_response_() {
@@ -375,11 +380,13 @@ void OpenthermHub::handle_protocol_error_() {
            this->opentherm_->protocol_error_to_str(error.error_type));
   this->opentherm_->debug_error(error);
   this->stop_opentherm_();
+  this->message_iterator_++;
 }
 
 void OpenthermHub::handle_timeout_error_() {
   ESP_LOGW(TAG, "Timeout while waiting for response from device");
   this->stop_opentherm_();
+  this->message_iterator_++;
 }
 
 void OpenthermHub::handle_timer_error_() {

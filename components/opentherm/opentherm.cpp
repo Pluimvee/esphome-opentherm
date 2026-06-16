@@ -1,402 +1,295 @@
 /*
- * OpenTherm protocol implementation. Originally taken from https://github.com/jpraus/arduino-opentherm, but
- * heavily modified to comply with ESPHome coding standards and provide better logging.
- * Original code is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
- * Public License, which is compatible with GPLv3 license, which covers C++ part of ESPHome project.
+ * ISR-based OpenTherm protocol implementation.
+ *
+ * Receive: GPIO CHANGE edge interrupt + micros() timing (Melnyk-style).
+ * Send:    Blocking Manchester bit-bang with delayMicroseconds(500).
+ *
+ * No hardware GP-timer is allocated.  The original ESPHome opentherm component
+ * used a 5 kHz timer for both sampling during receive and driving the output
+ * during send.  This version replaces both with simpler, hardware-timer-free
+ * equivalents that work on any platform supported by ESPHome.
+ *
+ * IMPORTANT: use sync_mode: true in the hub.  The blocking send (~34 ms) is
+ * acceptable in sync mode; in async mode it would stall the ESPHome loop.
  */
 
 #include "opentherm.h"
 #include "esphome/core/helpers.h"
-#if defined(ESP32) || defined(USE_ESP_IDF)
-#include "driver/timer.h"
-#include "esp_err.h"
+#include "esphome/core/hal.h"
+
+#ifdef USE_ESP32
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
 #endif
-#ifdef ESP8266
-#include "Arduino.h"
+#ifdef USE_ESP8266
+#include <Arduino.h>
 #endif
+
+#include <cinttypes>
 #include <string>
 
 namespace esphome {
 namespace opentherm {
 
 using std::string;
-using std::to_string;
 
-static const char *const TAG = "opentherm";
+static const char *const TAG = "opentherm_isr";
 
-#ifdef ESP8266
-OpenTherm *OpenTherm::instance = nullptr;
-#endif
+// Module-level instance pointer used by the static GPIO ISR helper.
+static OpenTherm *ot_instance_ = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+// ── Data helpers (identical to original) ─────────────────────────────────────
+
+float OpenthermData::f88() { return ((float) this->s16()) / 256.0f; }
+void OpenthermData::f88(float value) { this->s16((int16_t) (value * 256)); }
+
+uint16_t OpenthermData::u16() {
+  uint16_t const value = this->valueHB;
+  return (value << 8) | this->valueLB;
+}
+void OpenthermData::u16(uint16_t value) {
+  this->valueLB = value & 0xFF;
+  this->valueHB = (value >> 8) & 0xFF;
+}
+
+int16_t OpenthermData::s16() {
+  int16_t const value = this->valueHB;
+  return (value << 8) | this->valueLB;
+}
+void OpenthermData::s16(int16_t value) {
+  this->valueLB = value & 0xFF;
+  this->valueHB = (value >> 8) & 0xFF;
+}
+
+// ── Constructor ───────────────────────────────────────────────────────────────
 
 OpenTherm::OpenTherm(InternalGPIOPin *in_pin, InternalGPIOPin *out_pin, int32_t device_timeout)
     : in_pin_(in_pin),
       out_pin_(out_pin),
-#if defined(ESP32) || defined(USE_ESP_IDF)
-      timer_group_(TIMER_GROUP_0),
-      timer_idx_(TIMER_0),
-#endif
       mode_(OperationMode::IDLE),
       error_type_(ProtocolErrorType::NO_ERROR),
-      capture_(0),
-      clock_(0),
-      data_(0),
-      bit_pos_(0),
-      timeout_counter_(-1),
       device_timeout_(device_timeout) {
   this->isr_in_pin_ = in_pin->to_isr();
   this->isr_out_pin_ = out_pin->to_isr();
 }
 
+// ── Initialization ────────────────────────────────────────────────────────────
+
 bool OpenTherm::initialize() {
-#ifdef ESP8266
-  OpenTherm::instance = this;
-#endif
   this->in_pin_->pin_mode(gpio::FLAG_INPUT);
   this->in_pin_->setup();
   this->out_pin_->pin_mode(gpio::FLAG_OUTPUT);
   this->out_pin_->setup();
-  this->out_pin_->digital_write(true);
+  this->out_pin_->digital_write(true);  // idle HIGH
 
-#if defined(ESP32) || defined(USE_ESP_IDF)
-  return this->init_esp32_timer_();
-#else
-  return true;
+  ot_instance_ = this;
+
+#ifdef USE_ESP32
+  // Install GPIO ISR service (no-op if already installed by ESPHome core).
+  esp_err_t err = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    ESP_LOGE(TAG, "Failed to install GPIO ISR service: %d", err);
+    return false;
+  }
+  const auto pin_num = (gpio_num_t) this->in_pin_->get_pin();
+  gpio_set_intr_type(pin_num, GPIO_INTR_ANYEDGE);
+  gpio_isr_handler_add(pin_num, handle_interrupt_helper_, this);
+  gpio_intr_disable(pin_num);  // enabled only when listen() is called
 #endif
+
+  return true;
 }
 
-void OpenTherm::listen() {
-  this->stop_timer_();
-  this->timeout_counter_ = this->device_timeout_ * 5;  // timer_ ticks at 5 ticks/ms
+// ── GPIO edge ISR ─────────────────────────────────────────────────────────────
+//
+// Called on every CHANGE of the input pin.  Implements Melnyk-style Manchester
+// decoding: only edges >750 µs from the last processed edge represent new bits.
+//
+// OpenTherm Manchester convention on the input line (after transceiver):
+//   idle  = LOW
+//   "1" bit: HIGH (first half) → LOW (second half); mid-bit edge is HIGH→LOW
+//   "0" bit: LOW  (first half) → HIGH (second half); mid-bit edge is LOW→HIGH
+//
+// At a significant (>750 µs) edge: bit value = !level_after_edge
+//   H→L edge → !LOW  = 1 ✓
+//   L→H edge → !HIGH = 0 ✓
 
+void IRAM_ATTR OpenTherm::handle_interrupt_helper_(void *arg) {
+  auto *self = static_cast<OpenTherm *>(arg);
+  self->handle_interrupt_();
+}
+
+void IRAM_ATTR OpenTherm::handle_interrupt_() {
+  const uint32_t now = micros();
+  const bool level = this->isr_in_pin_.digital_read();
+
+  if (this->mode_ == OperationMode::LISTEN) {
+    if (level) {
+      // Rising edge: first half of start bit.
+      this->start_bit_seen_ = true;
+      this->last_edge_us_ = now;
+    } else if (this->start_bit_seen_ && (now - this->last_edge_us_) < 750) {
+      // Falling edge within 750 µs: start bit confirmed, begin data read.
+      this->mode_ = OperationMode::READ;
+      this->data_ = 0;
+      this->bit_pos_ = 0;
+      this->last_edge_us_ = now;
+      this->start_bit_seen_ = false;
+    } else {
+      this->start_bit_seen_ = false;  // false start, reset
+    }
+    return;
+  }
+
+  if (this->mode_ == OperationMode::READ) {
+    const uint32_t dt = now - this->last_edge_us_;
+    if (dt < 750)
+      return;  // mid-bit transition, skip
+
+    this->last_edge_us_ = now;
+
+    if (this->bit_pos_ < 32) {
+      this->data_ = (this->data_ << 1) | static_cast<uint32_t>(!level);
+      this->bit_pos_++;
+      return;
+    }
+
+    // Stop bit received — update mode only, do NOT call gpio_intr_disable from ISR context.
+    // The interrupt stays enabled; subsequent edges are ignored (mode is no longer READ/LISTEN).
+    if (!level) {  // HIGH→LOW: logical "1" stop bit
+      if (check_parity_(this->data_)) {
+        this->mode_ = OperationMode::RECEIVED;
+      } else {
+        this->error_type_ = ProtocolErrorType::PARITY_ERROR;
+        this->error_data_ = this->data_;
+        this->error_bit_pos_ = this->bit_pos_;
+        this->mode_ = OperationMode::ERROR_PROTOCOL;
+      }
+    } else {  // LOW→HIGH: invalid stop bit
+      this->error_type_ = ProtocolErrorType::INVALID_STOP_BIT;
+      this->error_data_ = this->data_;
+      this->error_bit_pos_ = this->bit_pos_;
+      this->mode_ = OperationMode::ERROR_PROTOCOL;
+    }
+  }
+}
+
+// ── Interrupt attach / detach ─────────────────────────────────────────────────
+
+void OpenTherm::listen() {
+  this->detach_interrupt_();  // ensure clean state
   this->mode_ = OperationMode::LISTEN;
   this->data_ = 0;
   this->bit_pos_ = 0;
+  this->start_bit_seen_ = false;
+  this->listen_start_ms_ = millis();
 
-  this->start_read_timer_();
+#ifdef USE_ESP32
+  gpio_intr_enable((gpio_num_t) this->in_pin_->get_pin());
+  // If the line is already HIGH we missed the rising edge of the start bit.
+  // Set start_bit_seen_ so the next falling edge will correctly enter READ mode.
+  if (this->isr_in_pin_.digital_read()) {
+    this->start_bit_seen_ = true;
+    this->last_edge_us_ = micros();
+  }
+#elif defined(USE_ESP8266)
+  attachInterrupt(digitalPinToInterrupt(this->in_pin_->get_pin()),
+                  []() IRAM_ATTR { ot_instance_->handle_interrupt_(); }, CHANGE);
+#endif
 }
 
-void OpenTherm::send(OpenthermData &data) {
-  this->stop_timer_();
-  this->data_ = data.type;
-  this->data_ = (this->data_ << 12) | data.id;
-  this->data_ = (this->data_ << 8) | data.valueHB;
-  this->data_ = (this->data_ << 8) | data.valueLB;
-  if (!check_parity_(this->data_)) {
-    this->data_ = this->data_ | 0x80000000;
-  }
-
-  this->clock_ = 1;     // clock starts at HIGH
-  this->bit_pos_ = 33;  // count down (33 == start bit, 32-1 data, 0 == stop bit)
-  this->mode_ = OperationMode::WRITE;
-
-  this->start_write_timer_();
-}
-
-bool OpenTherm::get_message(OpenthermData &data) {
-  if (this->mode_ == OperationMode::RECEIVED) {
-    data.type = (this->data_ >> 28) & 0x7;
-    data.id = (this->data_ >> 16) & 0xFF;
-    data.valueHB = (this->data_ >> 8) & 0xFF;
-    data.valueLB = this->data_ & 0xFF;
-    return true;
-  }
-  return false;
-}
-
-bool OpenTherm::get_protocol_error(OpenThermError &error) {
-  if (this->mode_ != OperationMode::ERROR_PROTOCOL) {
-    return false;
-  }
-
-  error.error_type = this->error_type_;
-  error.bit_pos = this->bit_pos_;
-  error.capture = this->capture_;
-  error.clock = this->clock_;
-  error.data = this->data_;
-
-  return true;
+void OpenTherm::detach_interrupt_() {
+#ifdef USE_ESP32
+  gpio_intr_disable((gpio_num_t) this->in_pin_->get_pin());
+#elif defined(USE_ESP8266)
+  detachInterrupt(digitalPinToInterrupt(this->in_pin_->get_pin()));
+#endif
 }
 
 void OpenTherm::stop() {
-  this->stop_timer_();
+  this->detach_interrupt_();
   this->mode_ = OperationMode::IDLE;
 }
 
-void IRAM_ATTR OpenTherm::read_() {
-  this->data_ = 0;
-  this->bit_pos_ = 0;
-  this->mode_ = OperationMode::READ;
-  this->capture_ = 1;         // reset counter and add as if read start bit
-  this->clock_ = 1;           // clock is high at the start of comm
-  this->start_read_timer_();  // get us into 1/4 of manchester code. 5 timer ticks constitute 1 ms, which is 1 bit
-                              // period in OpenTherm.
-}
+// ── Send: blocking Manchester bit-bang ───────────────────────────────────────
+//
+// Each bit period = 1 ms = two 500 µs half-periods.
+// Logical 1: first half LOW  (active), second half HIGH (idle)
+// Logical 0: first half HIGH (idle),   second half LOW  (active)
+// (OpenTherm output active = LOW)
+//
+// FreeRTOS tasks are suspended during the 34 ms frame so that task-switch
+// jitter does not corrupt the Manchester timing.
 
-bool IRAM_ATTR OpenTherm::timer_isr(OpenTherm *arg) {
-  if (arg->mode_ == OperationMode::LISTEN) {
-    if (arg->timeout_counter_ == 0) {
-      arg->mode_ = OperationMode::ERROR_TIMEOUT;
-      arg->stop_timer_();
-      return false;
-    }
-    bool const value = arg->isr_in_pin_.digital_read();
-    if (value) {  // incoming data (rising signal)
-      arg->read_();
-    }
-    if (arg->timeout_counter_ > 0) {
-      arg->timeout_counter_--;
-    }
-  } else if (arg->mode_ == OperationMode::READ) {
-    bool const value = arg->isr_in_pin_.digital_read();
-    uint8_t const last = (arg->capture_ & 1);
-    if (value != last) {
-      // transition of signal from last sampling
-      if (arg->clock_ == 1 && arg->capture_ > 0xF) {
-        // no transition in the middle of the bit
-        arg->mode_ = OperationMode::ERROR_PROTOCOL;
-        arg->error_type_ = ProtocolErrorType::NO_TRANSITION;
-        arg->stop_timer_();
-        return false;
-      } else if (arg->clock_ == 1 || arg->capture_ > 0xF) {
-        // transition in the middle of the bit OR no transition between two bit, both are valid data points
-        if (arg->bit_pos_ == BitPositions::STOP_BIT) {
-          // expecting stop bit
-          auto stop_bit_error = arg->verify_stop_bit_(last);
-          if (stop_bit_error == ProtocolErrorType::NO_ERROR) {
-            arg->mode_ = OperationMode::RECEIVED;
-            arg->stop_timer_();
-            return false;
-          } else {
-            // end of data not verified, invalid data
-            arg->mode_ = OperationMode::ERROR_PROTOCOL;
-            arg->error_type_ = stop_bit_error;
-            arg->stop_timer_();
-            return false;
-          }
-        } else {
-          // normal data point at clock high
-          arg->bit_read_(last);
-          arg->clock_ = 0;
-        }
-      } else {
-        // clock low, not a data point, switch clock
-        arg->clock_ = 1;
-      }
-      arg->capture_ = 1;  // reset counter
-    } else if (arg->capture_ > 0xFF) {
-      // no change for too long, invalid manchester encoding
-      arg->mode_ = OperationMode::ERROR_PROTOCOL;
-      arg->error_type_ = ProtocolErrorType::NO_CHANGE_TOO_LONG;
-      arg->stop_timer_();
-      return false;
-    }
-    arg->capture_ = (arg->capture_ << 1) | value;
-  } else if (arg->mode_ == OperationMode::WRITE) {
-    // write data to pin
-    if (arg->bit_pos_ == 33 || arg->bit_pos_ == 0) {  // start bit
-      arg->write_bit_(1, arg->clock_);
-    } else {  // data bits
-      arg->write_bit_(read_bit(arg->data_, arg->bit_pos_ - 1), arg->clock_);
-    }
-    if (arg->clock_ == 0) {
-      if (arg->bit_pos_ <= 0) {            // check termination
-        arg->mode_ = OperationMode::SENT;  // all data written
-        arg->stop_timer_();
-      }
-      arg->bit_pos_--;
-      arg->clock_ = 1;
-    } else {
-      arg->clock_ = 0;
-    }
+void OpenTherm::send_bit_(bool high) {
+  if (high) {
+    this->isr_out_pin_.digital_write(false);  // first half: active (LOW)
+    delayMicroseconds(500);
+    this->isr_out_pin_.digital_write(true);   // second half: idle (HIGH)
+  } else {
+    this->isr_out_pin_.digital_write(true);   // first half: idle (HIGH)
+    delayMicroseconds(500);
+    this->isr_out_pin_.digital_write(false);  // second half: active (LOW)
   }
-
-  return false;
+  delayMicroseconds(500);
 }
 
-#ifdef ESP8266
-void IRAM_ATTR OpenTherm::esp8266_timer_isr() { OpenTherm::timer_isr(OpenTherm::instance); }
+void OpenTherm::send(OpenthermData &data) {
+  this->mode_ = OperationMode::WRITE;
+
+  uint32_t frame = data.type;
+  frame = (frame << 12) | data.id;
+  frame = (frame << 8) | data.valueHB;
+  frame = (frame << 8) | data.valueLB;
+  if (!check_parity_(frame))
+    frame |= 0x80000000UL;
+
+#ifdef USE_ESP32
+  // Suspend FreeRTOS task switching to keep 500 µs timing tight.
+  vTaskSuspendAll();
 #endif
 
-void IRAM_ATTR OpenTherm::bit_read_(uint8_t value) {
-  this->data_ = (this->data_ << 1) | value;
-  this->bit_pos_++;
+  this->send_bit_(true);   // start bit (always "1")
+  for (int i = 31; i >= 0; i--)
+    this->send_bit_(read_bit(frame, i));
+  this->send_bit_(true);   // stop bit  (always "1")
+
+  this->isr_out_pin_.digital_write(true);  // return to idle
+
+#ifdef USE_ESP32
+  xTaskResumeAll();
+#endif
+
+  this->mode_ = OperationMode::SENT;
 }
 
-ProtocolErrorType IRAM_ATTR OpenTherm::verify_stop_bit_(uint8_t value) {
-  if (value) {  // stop bit detected
-    return check_parity_(this->data_) ? ProtocolErrorType::NO_ERROR : ProtocolErrorType::PARITY_ERROR;
-  } else {  // no stop bit detected, error
-    return ProtocolErrorType::INVALID_STOP_BIT;
-  }
-}
+// ── Response retrieval ────────────────────────────────────────────────────────
 
-void IRAM_ATTR OpenTherm::write_bit_(uint8_t high, uint8_t clock) {
-  if (clock == 1) {                           // left part of manchester encoding
-    this->isr_out_pin_.digital_write(!high);  // low means logical 1 to protocol
-  } else {                                    // right part of manchester encoding
-    this->isr_out_pin_.digital_write(high);   // high means logical 0 to protocol
-  }
-}
-
-#if defined(ESP32) || defined(USE_ESP_IDF)
-
-bool OpenTherm::init_esp32_timer_() {
-  // Search for a free timer. Maybe unstable, we'll see.
-  int cur_timer = 0;
-  timer_group_t timer_group = TIMER_GROUP_0;
-  timer_idx_t timer_idx = TIMER_0;
-  bool timer_found = false;
-
-  for (; cur_timer < SOC_TIMER_GROUP_TOTAL_TIMERS; cur_timer++) {
-    timer_config_t temp_config;
-    timer_group = cur_timer < 2 ? TIMER_GROUP_0 : TIMER_GROUP_1;
-    timer_idx = cur_timer < 2 ? (timer_idx_t) cur_timer : (timer_idx_t) (cur_timer - 2);
-
-    auto err = timer_get_config(timer_group, timer_idx, &temp_config);
-    if (err == ESP_ERR_INVALID_ARG) {
-      // Error means timer was not initialized (or other things, but we are careful with our args)
-      timer_found = true;
-      break;
-    }
-
-    ESP_LOGD(TAG, "Timer %d:%d seems to be occupied, will try another", timer_group, timer_idx);
-  }
-
-  if (!timer_found) {
-    ESP_LOGE(TAG, "No free timer was found! OpenTherm cannot function without a timer.");
+bool OpenTherm::get_message(OpenthermData &data) {
+  if (this->mode_ != OperationMode::RECEIVED)
     return false;
-  }
-
-  ESP_LOGD(TAG, "Found free timer %d:%d", timer_group, timer_idx);
-  this->timer_group_ = timer_group;
-  this->timer_idx_ = timer_idx;
-
-  timer_config_t const config = {
-      .alarm_en = TIMER_ALARM_EN,
-      .counter_en = TIMER_PAUSE,
-      .intr_type = TIMER_INTR_LEVEL,
-      .counter_dir = TIMER_COUNT_UP,
-      .auto_reload = TIMER_AUTORELOAD_EN,
-      .clk_src = TIMER_SRC_CLK_DEFAULT,
-      .divider = 80,
-  };
-
-  esp_err_t result;
-
-  result = timer_init(this->timer_group_, this->timer_idx_, &config);
-  if (result != ESP_OK) {
-    const auto *error = esp_err_to_name(result);
-    ESP_LOGE(TAG, "Failed to init timer. Error: %s", error);
-    return false;
-  }
-
-  result = timer_set_counter_value(this->timer_group_, this->timer_idx_, 0);
-  if (result != ESP_OK) {
-    const auto *error = esp_err_to_name(result);
-    ESP_LOGE(TAG, "Failed to set counter value. Error: %s", error);
-    return false;
-  }
-
-  result = timer_isr_callback_add(this->timer_group_, this->timer_idx_, reinterpret_cast<bool (*)(void *)>(timer_isr),
-                                  this, 0);
-  if (result != ESP_OK) {
-    const auto *error = esp_err_to_name(result);
-    ESP_LOGE(TAG, "Failed to register timer interrupt. Error: %s", error);
-    return false;
-  }
-
+  data.type    = (this->data_ >> 28) & 0x7;
+  data.id      = (this->data_ >> 16) & 0xFF;
+  data.valueHB = (this->data_ >> 8)  & 0xFF;
+  data.valueLB = this->data_ & 0xFF;
   return true;
 }
 
-void IRAM_ATTR OpenTherm::start_esp32_timer_(uint64_t alarm_value) {
-  // We will report timer errors outside of interrupt handler
-  this->timer_error_ = ESP_OK;
-  this->timer_error_type_ = TimerErrorType::NO_TIMER_ERROR;
-
-  this->timer_error_ = timer_set_alarm_value(this->timer_group_, this->timer_idx_, alarm_value);
-  if (this->timer_error_ != ESP_OK) {
-    this->timer_error_type_ = TimerErrorType::SET_ALARM_VALUE_ERROR;
-    return;
-  }
-  this->timer_error_ = timer_start(this->timer_group_, this->timer_idx_);
-  if (this->timer_error_ != ESP_OK) {
-    this->timer_error_type_ = TimerErrorType::TIMER_START_ERROR;
-  }
+bool OpenTherm::get_protocol_error(OpenThermError &error) {
+  if (this->mode_ != OperationMode::ERROR_PROTOCOL)
+    return false;
+  error.error_type = this->error_type_;
+  error.data       = this->error_data_;
+  error.bit_pos    = this->error_bit_pos_;
+  error.capture    = 0;
+  error.clock      = 0;
+  return true;
 }
 
-void OpenTherm::report_and_reset_timer_error() {
-  if (this->timer_error_ == ESP_OK) {
-    return;
-  }
+// ── Parity ────────────────────────────────────────────────────────────────────
 
-  ESP_LOGE(TAG, "Error occured while manipulating timer (%s): %s", this->timer_error_to_str(this->timer_error_type_),
-           esp_err_to_name(this->timer_error_));
-
-  this->timer_error_ = ESP_OK;
-  this->timer_error_type_ = NO_TIMER_ERROR;
-}
-
-// 5 kHz timer_
-void IRAM_ATTR OpenTherm::start_read_timer_() {
-  InterruptLock const lock;
-  this->start_esp32_timer_(200);
-}
-
-// 2 kHz timer_
-void IRAM_ATTR OpenTherm::start_write_timer_() {
-  InterruptLock const lock;
-  this->start_esp32_timer_(500);
-}
-
-void IRAM_ATTR OpenTherm::stop_timer_() {
-  InterruptLock const lock;
-  // We will report timer errors outside of interrupt handler
-  this->timer_error_ = ESP_OK;
-  this->timer_error_type_ = TimerErrorType::NO_TIMER_ERROR;
-
-  this->timer_error_ = timer_pause(this->timer_group_, this->timer_idx_);
-  if (this->timer_error_ != ESP_OK) {
-    this->timer_error_type_ = TimerErrorType::TIMER_PAUSE_ERROR;
-    return;
-  }
-  this->timer_error_ = timer_set_counter_value(this->timer_group_, this->timer_idx_, 0);
-  if (this->timer_error_ != ESP_OK) {
-    this->timer_error_type_ = TimerErrorType::SET_COUNTER_VALUE_ERROR;
-  }
-}
-
-#endif  // END ESP32
-
-#ifdef ESP8266
-// 5 kHz timer_
-void IRAM_ATTR OpenTherm::start_read_timer_() {
-  InterruptLock const lock;
-  timer1_attachInterrupt(OpenTherm::esp8266_timer_isr);
-  timer1_enable(TIM_DIV16, TIM_EDGE, TIM_LOOP);  // 5MHz (5 ticks/us - 1677721.4 us max)
-  timer1_write(1000);                            // 5kHz
-}
-
-// 2 kHz timer_
-void IRAM_ATTR OpenTherm::start_write_timer_() {
-  InterruptLock const lock;
-  timer1_attachInterrupt(OpenTherm::esp8266_timer_isr);
-  timer1_enable(TIM_DIV16, TIM_EDGE, TIM_LOOP);  // 5MHz (5 ticks/us - 1677721.4 us max)
-  timer1_write(2500);                            // 2kHz
-}
-
-void IRAM_ATTR OpenTherm::stop_timer_() {
-  InterruptLock const lock;
-  timer1_disable();
-  timer1_detachInterrupt();
-}
-
-// There is nothing to report on ESP8266
-void OpenTherm::report_and_reset_timer_error() {}
-
-#endif  // END ESP8266
-
-// https://stackoverflow.com/questions/21617970/how-to-check-if-value-has-even-parity-of-bits-or-odd
-bool IRAM_ATTR OpenTherm::check_parity_(uint32_t val) {
+bool OpenTherm::check_parity_(uint32_t val) {
   val ^= val >> 16;
   val ^= val >> 8;
   val ^= val >> 4;
@@ -404,6 +297,26 @@ bool IRAM_ATTR OpenTherm::check_parity_(uint32_t val) {
   val ^= val >> 1;
   return (~val) & 1;
 }
+
+// ── Logging helpers (identical to original) ───────────────────────────────────
+
+void OpenTherm::debug_data(OpenthermData &data) {
+  char type_buf[9], id_buf[9], hb_buf[9], lb_buf[9];
+  ESP_LOGD(TAG, "%s %s %s %s",
+           format_bin_to(type_buf, data.type),
+           format_bin_to(id_buf,   data.id),
+           format_bin_to(hb_buf,   data.valueHB),
+           format_bin_to(lb_buf,   data.valueLB));
+  ESP_LOGD(TAG, "type: %s; id: %u; HB: %u; LB: %u; uint_16: %u; float: %f",
+           this->message_type_to_str((MessageType) data.type),
+           data.id, data.valueHB, data.valueLB, data.u16(), data.f88());
+}
+
+void OpenTherm::debug_error(OpenThermError &error) const {
+  ESP_LOGD(TAG, "data: 0x%08" PRIx32 "; bit_pos: %u", error.data, error.bit_pos);
+}
+
+// ── String helpers ────────────────────────────────────────────────────────────
 
 #define TO_STRING_MEMBER(name) \
   case name: \
@@ -420,10 +333,10 @@ const char *OpenTherm::operation_mode_to_str(OperationMode mode) {
     TO_STRING_MEMBER(ERROR_PROTOCOL)
     TO_STRING_MEMBER(ERROR_TIMEOUT)
     TO_STRING_MEMBER(ERROR_TIMER)
-    default:
-      return "<INVALID>";
+    default: return "<INVALID>";
   }
 }
+
 const char *OpenTherm::protocol_error_to_str(ProtocolErrorType error_type) {
   switch (error_type) {
     TO_STRING_MEMBER(NO_ERROR)
@@ -431,10 +344,10 @@ const char *OpenTherm::protocol_error_to_str(ProtocolErrorType error_type) {
     TO_STRING_MEMBER(INVALID_STOP_BIT)
     TO_STRING_MEMBER(PARITY_ERROR)
     TO_STRING_MEMBER(NO_CHANGE_TOO_LONG)
-    default:
-      return "<INVALID>";
+    default: return "<INVALID>";
   }
 }
+
 const char *OpenTherm::timer_error_to_str(TimerErrorType error_type) {
   switch (error_type) {
     TO_STRING_MEMBER(NO_TIMER_ERROR)
@@ -442,10 +355,10 @@ const char *OpenTherm::timer_error_to_str(TimerErrorType error_type) {
     TO_STRING_MEMBER(TIMER_START_ERROR)
     TO_STRING_MEMBER(TIMER_PAUSE_ERROR)
     TO_STRING_MEMBER(SET_COUNTER_VALUE_ERROR)
-    default:
-      return "<INVALID>";
+    default: return "<INVALID>";
   }
 }
+
 const char *OpenTherm::message_type_to_str(MessageType message_type) {
   switch (message_type) {
     TO_STRING_MEMBER(READ_DATA)
@@ -455,8 +368,7 @@ const char *OpenTherm::message_type_to_str(MessageType message_type) {
     TO_STRING_MEMBER(INVALID_DATA)
     TO_STRING_MEMBER(DATA_INVALID)
     TO_STRING_MEMBER(UNKNOWN_DATAID)
-    default:
-      return "<INVALID>";
+    default: return "<INVALID>";
   }
 }
 
@@ -555,46 +467,8 @@ const char *OpenTherm::message_id_to_str(MessageId id) {
     TO_STRING_MEMBER(OT_VERSION_DEVICE)
     TO_STRING_MEMBER(VERSION_CONTROLLER)
     TO_STRING_MEMBER(VERSION_DEVICE)
-    default:
-      return "<INVALID>";
+    default: return "<INVALID>";
   }
-}
-
-void OpenTherm::debug_data(OpenthermData &data) {
-  ESP_LOGD(TAG, "%s %s %s %s", format_bin(data.type).c_str(), format_bin(data.id).c_str(),
-           format_bin(data.valueHB).c_str(), format_bin(data.valueLB).c_str());
-  ESP_LOGD(TAG, "type: %s; id: %s; HB: %s; LB: %s; uint_16: %s; float: %s",
-           this->message_type_to_str((MessageType) data.type), to_string(data.id).c_str(),
-           to_string(data.valueHB).c_str(), to_string(data.valueLB).c_str(), to_string(data.u16()).c_str(),
-           to_string(data.f88()).c_str());
-}
-void OpenTherm::debug_error(OpenThermError &error) const {
-  ESP_LOGD(TAG, "data: %s; clock: %s; capture: %s; bit_pos: %s", format_hex(error.data).c_str(),
-           to_string(clock_).c_str(), format_bin(error.capture).c_str(), to_string(error.bit_pos).c_str());
-}
-
-float OpenthermData::f88() { return ((float) this->s16()) / 256.0; }
-
-void OpenthermData::f88(float value) { this->s16((int16_t) (value * 256)); }
-
-uint16_t OpenthermData::u16() {
-  uint16_t const value = this->valueHB;
-  return (value << 8) | this->valueLB;
-}
-
-void OpenthermData::u16(uint16_t value) {
-  this->valueLB = value & 0xFF;
-  this->valueHB = (value >> 8) & 0xFF;
-}
-
-int16_t OpenthermData::s16() {
-  int16_t const value = this->valueHB;
-  return (value << 8) | this->valueLB;
-}
-
-void OpenthermData::s16(int16_t value) {
-  this->valueLB = value & 0xFF;
-  this->valueHB = (value >> 8) & 0xFF;
 }
 
 }  // namespace opentherm

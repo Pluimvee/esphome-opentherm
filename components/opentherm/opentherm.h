@@ -1,8 +1,19 @@
 /*
- * OpenTherm protocol implementation. Originally taken from https://github.com/jpraus/arduino-opentherm, but
- * heavily modified to comply with ESPHome coding standards and provide better logging.
- * Original code is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
- * Public License, which is compatible with GPLv3 license, which covers C++ part of ESPHome project.
+ * ISR-based OpenTherm protocol implementation for ESPHome.
+ *
+ * Based on the original ESPHome opentherm component (esphome/components/opentherm),
+ * which was in turn based on https://github.com/jpraus/arduino-opentherm.
+ *
+ * Key difference from the original: replaces the hardware GP-timer ISR with a
+ * GPIO edge interrupt + micros() approach, inspired by Ihor Melnyk's OpenTherm
+ * library (https://github.com/ihormelnyk/opentherm_library).
+ *
+ * Receive: GPIO CHANGE interrupt, bit decoded from edge timing with micros().
+ * Send:    Blocking Manchester encoding with delayMicroseconds(500) per half-bit.
+ *          Use sync_mode: true in the hub (recommended).
+ *
+ * No hardware timer is allocated. The ERROR_TIMER mode is kept for API
+ * compatibility with hub.cpp but is never set.
  */
 
 #pragma once
@@ -12,52 +23,43 @@
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 
-#if defined(ESP32) || defined(USE_ESP_IDF)
-#include "driver/timer.h"
-#endif
-
 namespace esphome {
 namespace opentherm {
 
 template<class T> constexpr T read_bit(T value, uint8_t bit) { return (value >> bit) & 0x01; }
-
 template<class T> constexpr T set_bit(T value, uint8_t bit) { return value |= (1UL << bit); }
-
 template<class T> constexpr T clear_bit(T value, uint8_t bit) { return value &= ~(1UL << bit); }
-
 template<class T> constexpr T write_bit(T value, uint8_t bit, uint8_t bit_value) {
   return bit_value ? set_bit(value, bit) : clear_bit(value, bit);
 }
 
 enum OperationMode {
-  IDLE = 0,  // no operation
-
-  LISTEN = 1,    // waiting for transmission to start
-  READ = 2,      // reading 32-bit data frame
-  RECEIVED = 3,  // data frame received with valid start and stop bit
-
-  WRITE = 4,  // writing data to output
-  SENT = 5,   // all data written to output
-
-  ERROR_PROTOCOL = 8,  // protocol error, can happed only during READ
-  ERROR_TIMEOUT = 9,   // timeout while waiting for response from device, only during LISTEN
-  ERROR_TIMER = 10     // error operating the ESP32 timer
+  IDLE = 0,
+  LISTEN = 1,
+  READ = 2,
+  RECEIVED = 3,
+  WRITE = 4,
+  SENT = 5,
+  ERROR_PROTOCOL = 8,
+  ERROR_TIMEOUT = 9,
+  ERROR_TIMER = 10,  // never set; kept for hub.cpp API compatibility
 };
 
 enum ProtocolErrorType {
-  NO_ERROR = 0,            // No error
-  NO_TRANSITION = 1,       // No transition in the middle of the bit
-  INVALID_STOP_BIT = 2,    // Stop bit wasn't present when expected
-  PARITY_ERROR = 3,        // Parity check didn't pass
-  NO_CHANGE_TOO_LONG = 4,  // No level change for too much timer ticks
+  NO_ERROR = 0,
+  NO_TRANSITION = 1,
+  INVALID_STOP_BIT = 2,
+  PARITY_ERROR = 3,
+  NO_CHANGE_TOO_LONG = 4,
 };
 
+// Kept for hub.cpp API compatibility; no timer is used.
 enum TimerErrorType {
-  NO_TIMER_ERROR = 0,           // No error
-  SET_ALARM_VALUE_ERROR = 1,    // No transition in the middle of the bit
-  TIMER_START_ERROR = 2,        // Stop bit wasn't present when expected
-  TIMER_PAUSE_ERROR = 3,        // Parity check didn't pass
-  SET_COUNTER_VALUE_ERROR = 4,  // No level change for too much timer ticks
+  NO_TIMER_ERROR = 0,
+  SET_ALARM_VALUE_ERROR = 1,
+  TIMER_START_ERROR = 2,
+  TIMER_PAUSE_ERROR = 3,
+  SET_COUNTER_VALUE_ERROR = 4,
 };
 
 enum MessageType {
@@ -67,7 +69,7 @@ enum MessageType {
   WRITE_ACK = 5,
   INVALID_DATA = 2,
   DATA_INVALID = 6,
-  UNKNOWN_DATAID = 7
+  UNKNOWN_DATAID = 7,
 };
 
 enum MessageId {
@@ -86,7 +88,7 @@ enum MessageId {
   FHB_SIZE = 12,
   FHB_COMMAND = 13,
   MAX_MODULATION_LEVEL = 14,
-  MAX_BOILER_CAPACITY = 15,  // u8_hb - u8_lb gives min modulation level
+  MAX_BOILER_CAPACITY = 15,
   ROOM_SETPOINT = 16,
   MODULATION_LEVEL = 17,
   CH_WATER_PRESSURE = 18,
@@ -115,8 +117,6 @@ enum MessageId {
   DHW_SETPOINT = 56,
   MAX_CH_SETPOINT = 57,
   OTC_CURVE_RATIO = 58,
-
-  // HVAC Specific Message IDs
   HVAC_STATUS = 70,
   REL_VENT_SETPOINT = 71,
   DEVICE_VENT = 74,
@@ -136,16 +136,10 @@ enum MessageId {
   HVAC_IDX_TSP = 89,
   HVAC_FHB_SIZE = 90,
   HVAC_FHB_IDX = 91,
-
   RF_SIGNAL = 98,
   DHW_MODE = 99,
   OVERRIDE_FUNC = 100,
-
-  // Solar Specific Message IDs
-  SOLAR_MODE_FLAGS = 101,  // hb0-2 Controller storage mode
-                           // lb0   Device fault
-                           // lb1-3 Device mode status
-                           // lb4-5 Device status
+  SOLAR_MODE_FLAGS = 101,
   SOLAR_ASF = 102,
   SOLAR_VERSION_ID = 103,
   SOLAR_PRODUCT_ID = 104,
@@ -157,7 +151,6 @@ enum MessageId {
   SOLAR_HOURS = 110,
   SOLAR_ENERGY = 111,
   SOLAR_TOTAL_ENERGY = 112,
-
   FAILED_BURNER_STARTS = 113,
   BURNER_FLAME_LOW = 114,
   OEM_DIAGNOSTIC = 115,
@@ -172,15 +165,11 @@ enum MessageId {
   OT_VERSION_CONTROLLER = 124,
   OT_VERSION_DEVICE = 125,
   VERSION_CONTROLLER = 126,
-  VERSION_DEVICE = 127
+  VERSION_DEVICE = 127,
 };
 
 enum BitPositions { STOP_BIT = 33 };
 
-/**
- * Structure to hold Opentherm data packet content.
- * Use f88(), u16() or s16() functions to get appropriate value of data packet accoridng to id of message.
- */
 struct OpenthermData {
   uint8_t type;
   uint8_t id;
@@ -189,34 +178,11 @@ struct OpenthermData {
 
   OpenthermData() : type(0), id(0), valueHB(0), valueLB(0) {}
 
-  /**
-   * @return float representation of data packet value
-   */
   float f88();
-
-  /**
-   * @param float number to set as value of this data packet
-   */
   void f88(float value);
-
-  /**
-   * @return unsigned 16b integer representation of data packet value
-   */
   uint16_t u16();
-
-  /**
-   * @param unsigned 16b integer number to set as value of this data packet
-   */
   void u16(uint16_t value);
-
-  /**
-   * @return signed 16b integer representation of data packet value
-   */
   int16_t s16();
-
-  /**
-   * @param signed 16b integer number to set as value of this data packet
-   */
   void s16(int16_t value);
 };
 
@@ -228,127 +194,47 @@ struct OpenThermError {
   uint8_t bit_pos;
 };
 
-/**
- * Opentherm static class that supports either listening or sending Opentherm data packets in the same time
- */
 class OpenTherm {
  public:
-  OpenTherm(InternalGPIOPin *in_pin, InternalGPIOPin *out_pin, int32_t device_timeout = 800);
+  OpenTherm(InternalGPIOPin *in_pin, InternalGPIOPin *out_pin, int32_t device_timeout = 1000);
 
-  /**
-   * Setup pins.
-   */
   bool initialize();
-
-  /**
-   * Start listening for Opentherm data packet comming from line connected to given pin.
-   * If data packet is received then has_message() function returns true and data packet can be retrieved by calling
-   * get_message() function. If timeout > 0 then this function waits for incomming data package for timeout millis and
-   * if no data packet is recevived, error state is indicated by is_error() function. If either data packet is received
-   * or timeout is reached listening is stopped.
-   */
   void listen();
-
-  /**
-   * Use this function to check whether listen() function already captured a valid data packet.
-   *
-   * @return true if data packet has been captured from line by listen() function.
-   */
-  bool has_message() { return mode_ == OperationMode::RECEIVED; }
-
-  /**
-   * Use this to retrive data packed captured by listen() function. Data packet is ready when has_message() function
-   * returns true. This function can be called multiple times until stop() is called.
-   *
-   * @param data reference to data structure to which fill the data packet data.
-   * @return true if packet was ready and was filled into data structure passed, false otherwise.
-   */
-  bool get_message(OpenthermData &data);
-
-  /**
-   * Immediately send out Opentherm data packet to line connected on given pin.
-   * Completed data transfer is indicated by is_sent() function.
-   * Error state is indicated by is_error() function.
-   *
-   * @param data Opentherm data packet.
-   */
   void send(OpenthermData &data);
-
-  /**
-   * Stops listening for data packet or sending out data packet and resets internal state of this class.
-   * Stops all timers and unattaches all interrupts.
-   */
+  bool get_message(OpenthermData &data);
+  bool get_protocol_error(OpenThermError &error);
   void stop();
 
-  /**
-   * Get protocol error details in case a protocol error occured.
-   * @param error reference to data structure to which fill the error details
-   * @return true if protocol error occured during last conversation, false otherwise.
-   */
-  bool get_protocol_error(OpenThermError &error);
+  bool has_message() { return mode_ == OperationMode::RECEIVED; }
+  bool is_sent()     { return mode_ == OperationMode::SENT; }
+  bool is_idle()     { return mode_ == OperationMode::IDLE; }
+  bool is_active()   { return mode_ == LISTEN || mode_ == READ || mode_ == WRITE; }
+  bool is_error()    { return mode_ == ERROR_TIMEOUT || mode_ == ERROR_PROTOCOL; }
+  bool is_timeout()  { return mode_ == ERROR_TIMEOUT; }
+  bool is_protocol_error() { return mode_ == ERROR_PROTOCOL; }
+  bool is_timer_error()    { return false; }
 
-  /**
-   * Use this function to check whether send() function already finished sending data packed to line.
-   *
-   * @return true if data packet has been sent, false otherwise.
-   */
-  bool is_sent() { return mode_ == OperationMode::SENT; }
-
-  /**
-   * Indicates whether listinig or sending is not in progress.
-   * That also means that no timers are running and no interrupts are attached.
-   *
-   * @return true if listening nor sending is in progress.
-   */
-  bool is_idle() { return mode_ == OperationMode::IDLE; }
-
-  /**
-   * Indicates whether last listen() or send() operation ends up with an error. Includes both timeout and
-   * protocol errors.
-   *
-   * @return true if last listen() or send() operation ends up with an error.
-   */
-  bool is_error() {
-    return mode_ == OperationMode::ERROR_TIMEOUT || mode_ == OperationMode::ERROR_PROTOCOL || mode_ == ERROR_TIMER;
+  // Timeout is checked lazily in get_mode() so it works without a timer in both sync and async hub modes.
+  OperationMode get_mode() {
+    if ((mode_ == LISTEN || mode_ == READ) && (millis() - listen_start_ms_) > (uint32_t) device_timeout_) {
+      this->detach_interrupt_();
+      mode_ = ERROR_TIMEOUT;
+    }
+    return mode_;
   }
 
-  /**
-   * Indicates whether last listen() or send() operation ends up with a *timeout* error
-   * @return true if last listen() or send() operation ends up with a *timeout* error.
-   */
-  bool is_timeout() { return mode_ == OperationMode::ERROR_TIMEOUT; }
-
-  /**
-   * Indicates whether last listen() or send() operation ends up with a *protocol* error
-   * @return true if last listen() or send() operation ends up with a *protocol* error.
-   */
-  bool is_protocol_error() { return mode_ == OperationMode::ERROR_PROTOCOL; }
-
-  /**
-   * Indicates whether start_esp32_timer_() or stop_timer_() had an error. Only relevant when used on ESP32.
-   * @return true if there was an error.
-   */
-  bool is_timer_error() { return mode_ == OperationMode::ERROR_TIMER; }
-
-  bool is_active() { return mode_ == LISTEN || mode_ == READ || mode_ == WRITE; }
-
-  OperationMode get_mode() { return mode_; }
+  void report_and_reset_timer_error() {}  // no-op
 
   void debug_data(OpenthermData &data);
   void debug_error(OpenThermError &error) const;
-  void report_and_reset_timer_error();
 
+  const char *operation_mode_to_str(OperationMode mode);
   const char *protocol_error_to_str(ProtocolErrorType error_type);
   const char *timer_error_to_str(TimerErrorType error_type);
   const char *message_type_to_str(MessageType message_type);
-  const char *operation_mode_to_str(OperationMode mode);
   const char *message_id_to_str(MessageId id);
 
-  static bool timer_isr(OpenTherm *arg);
-
-#ifdef ESP8266
-  static void esp8266_timer_isr();
-#endif
+  static void IRAM_ATTR handle_interrupt_helper_(void *arg);
 
  private:
   InternalGPIOPin *in_pin_;
@@ -356,43 +242,25 @@ class OpenTherm {
   ISRInternalGPIOPin isr_in_pin_;
   ISRInternalGPIOPin isr_out_pin_;
 
-#if defined(ESP32) || defined(USE_ESP_IDF)
-  timer_group_t timer_group_;
-  timer_idx_t timer_idx_;
-#endif
+  volatile OperationMode mode_{IDLE};
+  volatile uint32_t data_{0};
+  volatile uint8_t bit_pos_{0};
 
-  OperationMode mode_;
-  ProtocolErrorType error_type_;
-  uint32_t capture_;
-  uint8_t clock_;
-  uint32_t data_;
-  uint8_t bit_pos_;
-  int32_t timeout_counter_;  // <0 no timeout
-  int32_t device_timeout_;
+  // Edge-based receive state
+  volatile uint32_t last_edge_us_{0};   // micros() of last processed (significant) edge
+  volatile bool start_bit_seen_{false}; // HIGH edge of start bit detected, waiting for LOW
 
-#if defined(ESP32) || defined(USE_ESP_IDF)
-  esp_err_t timer_error_ = ESP_OK;
-  TimerErrorType timer_error_type_ = TimerErrorType::NO_TIMER_ERROR;
+  uint32_t listen_start_ms_{0};
+  int32_t device_timeout_;              // ms; used for timeout in get_mode()
 
-  bool init_esp32_timer_();
-  void start_esp32_timer_(uint64_t alarm_value);
-#endif
+  ProtocolErrorType error_type_{NO_ERROR};
+  uint32_t error_data_{0};
+  uint8_t error_bit_pos_{0};
 
-  void stop_timer_();
-
-  void read_();               // data detected start reading
-  void start_read_timer_();   // reading timer_ to sample at 1/5 of manchester code bit length (at 5kHz)
-  void start_write_timer_();  // writing timer_ to send manchester code (at 2kHz)
-  bool check_parity_(uint32_t val);
-
-  void bit_read_(uint8_t value);
-  ProtocolErrorType verify_stop_bit_(uint8_t value);
-  void write_bit_(uint8_t high, uint8_t clock);
-
-#ifdef ESP8266
-  // ESP8266 timer can accept callback with no parameters, so we have this hack to save a static instance of OpenTherm
-  static OpenTherm *instance;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-#endif
+  void IRAM_ATTR handle_interrupt_();
+  void detach_interrupt_();
+  void send_bit_(bool high);
+  static bool check_parity_(uint32_t val);
 };
 
 }  // namespace opentherm
