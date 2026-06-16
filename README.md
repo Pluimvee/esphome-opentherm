@@ -1,3 +1,25 @@
+# Ending multiple warnings per second ❗
+[20:16:45.778][W][opentherm:373]: Protocol error occured while receiving response: NO_TRANSITION
+
+[20:16:46.415][W][opentherm:373]: Protocol error occured while receiving response: NO_TRANSITION
+
+[20:16:46.591][W][opentherm:373]: Protocol error occured while receiving response: NO_TRANSITION
+
+[20:16:48.258][W][opentherm:373]: Protocol error occured while receiving response: NO_TRANSITION
+
+[20:16:50.367][W][opentherm:373]: Protocol error occured while receiving response: NO_TRANSITION
+
+[20:16:50.955][W][opentherm:373]: Protocol error occured while receiving response: NO_TRANSITION
+
+[20:16:51.572][W][opentherm:373]: Protocol error occured while receiving response: NO_TRANSITION
+
+# accepting a warning each 4 minutes
+21:51:30	[W]	[opentherm:379]	Protocol error occured while receiving response: PARITY_ERROR
+
+21:54:52	[W]	[opentherm:379]	Protocol error occured while receiving response: INVALID_STOP_BIT
+
+21:59:03	[W]	[opentherm:379]	Protocol error occured while receiving response: INVALID_STOP_BIT
+
 # ❗ OpenTherm in ESPHome core
 
 Starting with ESPHome 2024.11 this component is included in core! 🎉 There is no need to reference this repository for
