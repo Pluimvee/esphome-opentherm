@@ -1,19 +1,24 @@
-# Ending multiple warnings per second ❗
+# A more stable version of the Opentherm component❗
+Using the original pin edge interrupt instead of a timer interrupt
+
+I used Ihor Melnyk's libraries for some years using an ESP8266 and Arduino sketch without any issues. There were 2 DS18b20 sensors connected and a SPI connected display. WA webserver and HA connectivity, all fine!
+https://github.com/ihormelnyk/opentherm_library
+
+However I wanted to migrate to ESPHome bootstrap and started to use the ESPHome core component of opentherm.
+
+### ESPHome core component 
+Using the ESPHome core component I have got several warnings per second, indicating that there was lacking a level transition in the timeframe needed.
+While this warnig may be valid, and the issue with the boiler itself, I felt the core component to be too strict.
+
 [20:16:45.778][W][opentherm:373]: Protocol error occured while receiving response: NO_TRANSITION
 
 [20:16:46.415][W][opentherm:373]: Protocol error occured while receiving response: NO_TRANSITION
 
 [20:16:46.591][W][opentherm:373]: Protocol error occured while receiving response: NO_TRANSITION
 
-[20:16:48.258][W][opentherm:373]: Protocol error occured while receiving response: NO_TRANSITION
+### This component
+Using this edge interrupt based component I have a protocol warning each 4 minutes
 
-[20:16:50.367][W][opentherm:373]: Protocol error occured while receiving response: NO_TRANSITION
-
-[20:16:50.955][W][opentherm:373]: Protocol error occured while receiving response: NO_TRANSITION
-
-[20:16:51.572][W][opentherm:373]: Protocol error occured while receiving response: NO_TRANSITION
-
-# accepting a warning each 4 minutes
 21:51:30	[W]	[opentherm:379]	Protocol error occured while receiving response: PARITY_ERROR
 
 21:54:52	[W]	[opentherm:379]	Protocol error occured while receiving response: INVALID_STOP_BIT
